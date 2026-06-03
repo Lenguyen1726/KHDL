@@ -1,5 +1,5 @@
 # Importing Libraries
-
+import joblib
 import os
 import json
 import operator
@@ -8,6 +8,7 @@ from string import ascii_uppercase
 
 import cv2
 import numpy as np
+import mediapipe as mp
 import tkinter as tk
 from PIL import Image, ImageTk
 
@@ -66,7 +67,7 @@ def build_model_from_old_json(json_path):
 
             if not input_added:
                 model.add(InputLayer(
-                    shape=input_shape,
+                    input_shape=input_shape,
                     name=config.get("name"),
                     dtype=config.get("dtype", "float32")
                 ))
@@ -76,7 +77,7 @@ def build_model_from_old_json(json_path):
             # Nếu JSON không có InputLayer riêng thì lấy input_shape từ Conv2D đầu tiên
             if not input_added and "batch_input_shape" in config:
                 input_shape = tuple(config["batch_input_shape"][1:])
-                model.add(InputLayer(shape=input_shape))
+                model.add(InputLayer(input_shape=input_shape))
                 input_added = True
 
             model.add(Conv2D(
@@ -162,6 +163,21 @@ class Application:
         if not self.vs.isOpened():
             print("Không mở được camera. Kiểm tra quyền camera Windows.")
 
+        # =====================================================
+        # MEDIAPIPE HAND DETECTION
+        # =====================================================
+
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            model_complexity=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+
         self.current_image = None
         self.current_image2 = None
 
@@ -169,33 +185,61 @@ class Application:
         # LOAD MODELS
         # =====================================================
 
-        print("Loading models...")
+        print("Loading landmark model...")
 
-        self.loaded_model = load_old_model(
-            "model_new.json",
-            "model_new.h5",
-            "Main model"
-        )
+        landmark_package = joblib.load(MODELS_DIR / "asl_landmark_model.joblib")
 
-        self.loaded_model_dru = load_old_model(
-            "model-bw_dru.json",
-            "model-bw_dru.h5",
-            "DRU model"
-        )
+        self.landmark_model = landmark_package["model"]
+        self.class_names = landmark_package["classes"]
 
-        self.loaded_model_tkdi = load_old_model(
-            "model-bw_tkdi.json",
-            "model-bw_tkdi.h5",
-            "TKDI model"
-        )
+        print("Loaded landmark model")
 
-        self.loaded_model_smn = load_old_model(
-            "model-bw_smn.json",
-            "model-bw_smn.h5",
-            "SMN model"
-        )
+        # Tắt toàn bộ group model để test chuẩn Kaggle trước
+        self.use_group_mns = False
+        self.group_mns = None
+        self.group_mns_labels = ["M", "N", "S"]
 
-        print("Loaded model from disk")
+        self.use_group_dfl_txy = False
+        self.group_dfl_txy = None
+        self.group_dfl_txy_labels = ["D", "F", "L", "T", "X", "Y"]
+
+        # =====================================================
+        # LOAD GROUP MODEL M/N/S
+        # =====================================================
+
+        mns_path = MODELS_DIR / "asl_group_mns.joblib"
+
+        if mns_path.exists():
+            self.group_mns = joblib.load(mns_path)
+            self.group_mns_labels = ["M", "N", "S"]
+            self.use_group_mns = True
+            print("Loaded group model M/N/S")
+        else:
+            self.group_mns = None
+            self.group_mns_labels = ["M", "N", "S"]
+            self.use_group_mns = False
+            print("Group model M/N/S not found")
+
+        # =====================================================
+        # TẠM TẮT GROUP D/F/L/T/X/Y
+        # =====================================================
+
+        self.group_dfl_txy = None
+        self.group_dfl_txy_labels = ["D", "F", "L", "T", "X", "Y"]
+        self.use_group_dfl_txy = False
+
+        print("Group D/F/L/T/X/Y is disabled for stability")
+
+        group_path = MODELS_DIR / "asl_group_dfl_txy.joblib"
+
+        if group_path.exists():
+            self.group_dfl_txy = joblib.load(group_path)
+            self.use_group_dfl_txy = True
+            print("Loaded group model D/F/L/T/X/Y")
+        else:
+            self.group_dfl_txy = None
+            self.use_group_dfl_txy = False
+            print("Group model D/F/L/T/X/Y not found, running main model only")
 
         # =====================================================
         # COUNTER
@@ -221,7 +265,7 @@ class Application:
         self.panel.place(x=100, y=10, width=580, height=580)
 
         self.panel2 = tk.Label(self.root)
-        self.panel2.place(x=400, y=65, width=275, height=275)
+        # self.panel2.place(x=400, y=65, width=275, height=275)
 
         self.T = tk.Label(self.root)
         self.T.place(x=60, y=5)
@@ -277,6 +321,17 @@ class Application:
         self.str = ""
         self.word = ""
         self.current_symbol = "Empty"
+        self.current_confidence = 0.0
+        self.min_confidence = 0.70
+
+        self.last_symbol = None
+        self.stable_count = 0
+        self.stable_required = 10
+
+        self.add_cooldown = 0
+        self.no_hand_count = 0
+        self.no_hand_required = 20
+
         self.photo = "Empty"
 
         self.video_loop()
@@ -312,6 +367,257 @@ class Application:
         except Exception:
             return []
 
+    def preprocess_hand_mediapipe(self, frame):
+        """
+        Dùng MediaPipe phát hiện bàn tay.
+        Cắt sát vùng bàn tay, xóa nền và giữ ảnh màu RGB.
+        Phù hợp với model CNN ảnh màu.
+        """
+
+        frame = cv2.flip(frame, 1)
+        frame_h, frame_w = frame.shape[:2]
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb_frame)
+
+        if not results.multi_hand_landmarks:
+            cv2.putText(
+                frame,
+                "No hand",
+                (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+            return None, frame
+
+        hand_landmarks = results.multi_hand_landmarks[0]
+
+        points = []
+
+        for lm in hand_landmarks.landmark:
+            x = int(lm.x * frame_w)
+            y = int(lm.y * frame_h)
+            points.append([x, y])
+
+        points = np.array(points)
+
+        x_min = np.min(points[:, 0])
+        y_min = np.min(points[:, 1])
+        x_max = np.max(points[:, 0])
+        y_max = np.max(points[:, 1])
+
+        # Cắt theo hình vuông để không làm méo tay
+        box_w = x_max - x_min
+        box_h = y_max - y_min
+        box_size = max(box_w, box_h)
+
+        # Padding vừa phải, không quá lớn để tránh lấy nhiều nền
+        padding = int(box_size * 0.35)
+
+        cx = (x_min + x_max) // 2
+        cy = (y_min + y_max) // 2
+
+        half = box_size // 2 + padding
+
+        x1 = max(cx - half, 0)
+        y1 = max(cy - half, 0)
+        x2 = min(cx + half, frame_w)
+        y2 = min(cy + half, frame_h)
+
+        roi = frame[y1:y2, x1:x2]
+
+        if roi.size == 0:
+            return None, frame
+
+        # Vẽ landmark và khung tay lên camera
+        self.mp_drawing.draw_landmarks(
+            frame,
+            hand_landmarks,
+            self.mp_hands.HAND_CONNECTIONS
+        )
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "Hand detected",
+            (x1, max(y1 - 10, 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+        # Tạo mask bàn tay từ 21 landmark
+        points_roi = points - np.array([x1, y1])
+
+        mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+
+        hull = cv2.convexHull(points_roi)
+        cv2.fillConvexPoly(mask, hull, 255)
+
+        # Nới mask nhẹ để giữ đủ vùng ngón tay
+        kernel = np.ones((25, 25), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        # Xóa nền, nền chuyển thành đen
+        hand_only = cv2.bitwise_and(roi, roi, mask=mask)
+
+        # Resize ảnh màu
+        processed = cv2.resize(hand_only, (128, 128))
+
+        # OpenCV là BGR, model train bằng RGB
+        processed = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+
+        return processed, frame
+
+    def reset_stability(self):
+        self.last_symbol = None
+        self.stable_count = 0
+
+    def commit_word(self):
+        if len(self.word) == 0:
+            return
+
+        if len(self.str) > 0:
+            self.str += " "
+
+        self.str += self.word
+        self.word = ""
+
+    def extract_landmark_features(self, hand_landmarks):
+        points = []
+
+        for lm in hand_landmarks.landmark:
+            points.append([lm.x, lm.y, lm.z])
+
+        points = np.array(points, dtype=np.float32)
+
+        wrist = points[0].copy()
+        points = points - wrist
+
+        scale = np.max(np.linalg.norm(points[:, :2], axis=1))
+
+        if scale < 1e-6:
+            scale = 1.0
+
+        points = points / scale
+
+        return points.flatten().reshape(1, -1)
+
+    def get_landmark_from_frame(self, frame):
+        frame = cv2.flip(frame, 1)
+
+        frame_h, frame_w = frame.shape[:2]
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        results = self.hands.process(rgb_frame)
+
+        if not results.multi_hand_landmarks:
+            cv2.putText(
+                frame,
+                "No hand",
+                (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+
+            return None, frame
+
+        hand_landmarks = results.multi_hand_landmarks[0]
+
+        # Vẽ landmark
+        self.mp_drawing.draw_landmarks(
+            frame,
+            hand_landmarks,
+            self.mp_hands.HAND_CONNECTIONS
+        )
+
+        # Vẽ bounding box
+        points = []
+
+        for lm in hand_landmarks.landmark:
+            x = int(lm.x * frame_w)
+            y = int(lm.y * frame_h)
+            points.append([x, y])
+
+        points = np.array(points)
+
+        x_min = np.min(points[:, 0])
+        y_min = np.min(points[:, 1])
+        x_max = np.max(points[:, 0])
+        y_max = np.max(points[:, 1])
+
+        padding = 40
+
+        x1 = max(x_min - padding, 0)
+        y1 = max(y_min - padding, 0)
+        x2 = min(x_max + padding, frame_w)
+        y2 = min(y_max + padding, frame_h)
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "Hand detected",
+            (x1, max(y1 - 10, 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+        features = self.extract_landmark_features(hand_landmarks)
+
+        return features, frame
+
+    def predict_landmark(self, features):
+        probabilities = self.landmark_model.predict_proba(features)[0]
+
+        index = int(np.argmax(probabilities))
+        confidence = float(probabilities[index])
+
+        self.current_symbol = self.class_names[index]
+        self.current_confidence = confidence
+
+        if self.current_confidence < self.min_confidence:
+            self.current_symbol = "Uncertain"
+            self.reset_stability()
+            return
+
+        symbol = self.current_symbol
+
+        if symbol == self.last_symbol:
+            self.stable_count += 1
+        else:
+            self.last_symbol = symbol
+            self.stable_count = 1
+
+        if self.add_cooldown > 0:
+            self.add_cooldown -= 1
+            return
+
+        if self.stable_count >= self.stable_required:
+            self.word += symbol
+            self.add_cooldown = 20
+            self.stable_count = 0
     # =====================================================
     # VIDEO LOOP
     # =====================================================
@@ -320,185 +626,102 @@ class Application:
         ok, frame = self.vs.read()
 
         if ok:
-            frame = cv2.flip(frame, 1)
+            features, display_frame = self.get_landmark_from_frame(frame)
 
-            frame_h, frame_w = frame.shape[:2]
+            if features is not None:
+                self.no_hand_count = 0
+                self.predict_landmark(features)
 
-            # Vùng nhận diện tay ROI
-            x1 = int(0.5 * frame_w)
-            y1 = 10
-            x2 = frame_w - 10
-            y2 = min(y1 + 300, frame_h - 10)
+            else:
+                self.current_symbol = "No hand"
+                self.current_confidence = 0.0
+                self.reset_stability()
 
-            cv2.rectangle(
-                frame,
-                (x1 - 1, y1 - 1),
-                (x2 + 1, y2 + 1),
-                (255, 0, 0),
-                2
-            )
+                self.no_hand_count += 1
 
-            # Hiển thị ảnh camera
-            display_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+                if self.no_hand_count >= self.no_hand_required:
+                    self.commit_word()
+                    self.no_hand_count = 0
+
+            # Hiển thị camera chính
+            display_image = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGBA)
             self.current_image = Image.fromarray(display_image)
             imgtk = ImageTk.PhotoImage(image=self.current_image)
 
             self.panel.imgtk = imgtk
             self.panel.config(image=imgtk)
 
-            # Cắt ROI
-            roi = frame[y1:y2, x1:x2]
-
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-            blur = cv2.GaussianBlur(gray, (5, 5), 2)
-
-            th3 = cv2.adaptiveThreshold(
-                blur,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV,
-                11,
-                2
+            # Cập nhật chữ
+            self.panel3.config(
+                text=f"{self.current_symbol} ({self.current_confidence:.2f})",
+                font=("Courier", 30)
             )
 
-            _, res = cv2.threshold(
-                th3,
-                70,
-                255,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-            )
-
-            self.predict(res)
-
-            # Hiển thị ảnh threshold
-            self.current_image2 = Image.fromarray(res)
-            imgtk2 = ImageTk.PhotoImage(image=self.current_image2)
-
-            self.panel2.imgtk = imgtk2
-            self.panel2.config(image=imgtk2)
-
-            self.panel3.config(text=self.current_symbol, font=("Courier", 30))
             self.panel4.config(text=self.word, font=("Courier", 30))
             self.panel5.config(text=self.str, font=("Courier", 30))
 
             # Suggestions
             predicts = self.get_suggestions()
 
-            if len(predicts) > 0:
-                self.bt1.config(text=predicts[0], font=("Courier", 18))
-            else:
-                self.bt1.config(text="")
+            buttons = [self.bt1, self.bt2, self.bt3, self.bt4, self.bt5]
 
-            if len(predicts) > 1:
-                self.bt2.config(text=predicts[1], font=("Courier", 18))
-            else:
-                self.bt2.config(text="")
-
-            if len(predicts) > 2:
-                self.bt3.config(text=predicts[2], font=("Courier", 18))
-            else:
-                self.bt3.config(text="")
-
-            if len(predicts) > 3:
-                self.bt4.config(text=predicts[3], font=("Courier", 18))
-            else:
-                self.bt4.config(text="")
-
-            if len(predicts) > 4:
-                self.bt5.config(text=predicts[4], font=("Courier", 18))
-            else:
-                self.bt5.config(text="")
+            for i, button in enumerate(buttons):
+                if len(predicts) > i:
+                    button.config(text=predicts[i], font=("Courier", 18))
+                else:
+                    button.config(text="")
 
         self.root.after(5, self.video_loop)
 
+    def reset_counters(self):
+        self.ct["blank"] = 0
+
+        for i in ascii_uppercase:
+            self.ct[i] = 0
+
+    def reset_counters(self):
+        self.ct["blank"] = 0
+
+        for i in ascii_uppercase:
+            self.ct[i] = 0
     # =====================================================
     # PREDICT
     # =====================================================
 
     def predict(self, test_image):
         test_image = cv2.resize(test_image, (128, 128))
+
+        # Nếu lỡ ảnh là grayscale thì chuyển sang RGB
+        if len(test_image.shape) == 2:
+            test_image = cv2.cvtColor(test_image, cv2.COLOR_GRAY2RGB)
+
         test_image = test_image.astype("float32")
-        test_image = test_image.reshape(1, 128, 128, 1)
+        test_image = test_image.reshape(1, 128, 128, 3)
 
         result = self.loaded_model.predict(test_image, verbose=0)
 
-        result_dru = self.loaded_model_dru.predict(test_image, verbose=0)
-        result_tkdi = self.loaded_model_tkdi.predict(test_image, verbose=0)
-        result_smn = self.loaded_model_smn.predict(test_image, verbose=0)
+        index = int(np.argmax(result[0]))
+        confidence = float(result[0][index])
 
-        prediction = {}
-        prediction["blank"] = result[0][0]
+        self.current_symbol = self.class_names[index]
+        self.current_confidence = confidence
 
-        inde = 1
+        # Ngưỡng tin cậy, nếu thấp thì không ghi chữ
+        if confidence < self.min_confidence:
+            self.current_symbol = "Uncertain"
+            self.reset_counters()
+            return
 
-        for i in ascii_uppercase:
-            prediction[i] = result[0][inde]
-            inde += 1
-
-        # LAYER 1
-        prediction = sorted(
-            prediction.items(),
-            key=operator.itemgetter(1),
-            reverse=True
-        )
-
-        self.current_symbol = prediction[0][0]
-
-        # LAYER 2: D, R, U
-        if self.current_symbol in ["D", "R", "U"]:
-            prediction_dru = {}
-            prediction_dru["D"] = result_dru[0][0]
-            prediction_dru["R"] = result_dru[0][1]
-            prediction_dru["U"] = result_dru[0][2]
-
-            prediction_dru = sorted(
-                prediction_dru.items(),
-                key=operator.itemgetter(1),
-                reverse=True
-            )
-
-            self.current_symbol = prediction_dru[0][0]
-
-        # LAYER 2: D, I, K, T
-        if self.current_symbol in ["D", "I", "K", "T"]:
-            prediction_tkdi = {}
-            prediction_tkdi["D"] = result_tkdi[0][0]
-            prediction_tkdi["I"] = result_tkdi[0][1]
-            prediction_tkdi["K"] = result_tkdi[0][2]
-            prediction_tkdi["T"] = result_tkdi[0][3]
-
-            prediction_tkdi = sorted(
-                prediction_tkdi.items(),
-                key=operator.itemgetter(1),
-                reverse=True
-            )
-
-            self.current_symbol = prediction_tkdi[0][0]
-
-        # LAYER 2: M, N, S
-        if self.current_symbol in ["M", "N", "S"]:
-            prediction_smn = {}
-            prediction_smn["M"] = result_smn[0][0]
-            prediction_smn["N"] = result_smn[0][1]
-            prediction_smn["S"] = result_smn[0][2]
-
-            prediction_smn = sorted(
-                prediction_smn.items(),
-                key=operator.itemgetter(1),
-                reverse=True
-            )
-
-            self.current_symbol = prediction_smn[0][0]
-
-        # Nếu blank thì reset bộ đếm chữ cái
         if self.current_symbol == "blank":
             for i in ascii_uppercase:
                 self.ct[i] = 0
 
+        if self.current_symbol not in self.ct:
+            return
+
         self.ct[self.current_symbol] += 1
 
-        if self.ct[self.current_symbol] > 60:
+        if self.ct[self.current_symbol] > 30:
 
             for i in ascii_uppercase:
                 if i == self.current_symbol:
@@ -506,18 +729,11 @@ class Application:
 
                 tmp = abs(self.ct[self.current_symbol] - self.ct[i])
 
-                if tmp <= 20:
-                    self.ct["blank"] = 0
-
-                    for j in ascii_uppercase:
-                        self.ct[j] = 0
-
+                if tmp <= 10:
+                    self.reset_counters()
                     return
 
-            self.ct["blank"] = 0
-
-            for i in ascii_uppercase:
-                self.ct[i] = 0
+            self.reset_counters()
 
             if self.current_symbol == "blank":
 
@@ -536,7 +752,6 @@ class Application:
 
                 self.blank_flag = 0
                 self.word += self.current_symbol
-
     # =====================================================
     # ACTION SUGGESTION
     # =====================================================
@@ -583,6 +798,11 @@ class Application:
 
         try:
             self.vs.release()
+        except Exception:
+            pass
+
+        try:
+            self.hands.close()
         except Exception:
             pass
 
