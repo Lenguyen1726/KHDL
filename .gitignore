@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.venv310/
+
+# Kaggle / dataset
+kaggle_data/
+dataSet/
+dataSet_old_bw/
+dataSet_kaggle_color/
+dataSet_kaggle_processed/
+landmark_dataset/
+landmark_dataset_old/
+
+# Models / trained weights
+Models/*.joblib
+Models/*.keras
+Models/*.h5
+Models/*.hdf5
+
+# Evaluation outputs
+model_evaluation_results/
+*.csv
+
+# Secrets
+.kaggle/
+kaggle.json
+Models/*.json
