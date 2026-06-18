@@ -71,7 +71,7 @@ Lưu ý: Một số thư mục như `Models/`, `landmark_dataset/` và `kaggle_d
 Do file mô hình đã huấn luyện và dữ liệu landmark có dung lượng lớn, nhóm không đưa trực tiếp các file này lên GitHub. Người dùng có thể tải file assets đã chuẩn bị sẵn tại link sau:
 
 ```text
-(https://drive.google.com/file/d/1yn_RsoG11BjtlE9o1DQsH_AOawxQg-di/view?usp=sharing)
+https://drive.google.com/file/d/1yn_RsoG11BjtlE9o1DQsH_AOawxQg-di/view?usp=sharing
 ```
 
 Sau khi tải file `KHDL_assets.zip`, hãy giải nén vào thư mục gốc của project `KHDL`.
