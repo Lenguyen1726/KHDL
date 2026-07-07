@@ -6,3 +6,5 @@ pyspellchecker
 pandas
 scikit-learn
 joblib
+torch
+torchvision
