@@ -1,12 +1,15 @@
-import joblib
+
 from pathlib import Path
 
 import cv2
 import numpy as np
 import mediapipe as mp
 import tkinter as tk
+import torch
+
 from PIL import Image, ImageTk
 from spellchecker import SpellChecker
+from landmark_transformer_model import LandmarkTransformer
 
 
 # =====================================================
@@ -15,7 +18,10 @@ from spellchecker import SpellChecker
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "Models"
-
+MODEL_PATH = (
+    MODELS_DIR
+    / "asl_landmark_transformer.pth"
+)
 
 # =====================================================
 # APPLICATION
@@ -25,6 +31,16 @@ class Application:
 
     def __init__(self):
         self.spell = SpellChecker(language="en")
+        self.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        print(
+            "Transformer device:",
+            self.device
+        )
 
         # =====================================================
         # CAMERA
@@ -57,25 +73,65 @@ class Application:
         self.current_image = None
 
         # =====================================================
-        # LOAD LANDMARK MODEL ONLY
+        # LOAD LANDMARK TRANSFORMER
         # =====================================================
+        print("Loading landmark Transformer...")
 
-        print("Loading landmark model...")
-
-        model_path = MODELS_DIR / "asl_landmark_model.joblib"
-
-        if not model_path.exists():
+        if not MODEL_PATH.exists():
             raise FileNotFoundError(
-                f"Không tìm thấy model: {model_path}\n"
-                "Hãy chạy train_landmark_model_standard.py trước."
+                f"Không tìm thấy model: {MODEL_PATH}\n"
+                "Hãy chạy train_landmark_transformer.py trước."
             )
 
-        landmark_package = joblib.load(model_path)
+        checkpoint = self.load_checkpoint(
+            MODEL_PATH
+        )
 
-        self.landmark_model = landmark_package["model"]
-        self.class_names = landmark_package["classes"]
+        self.class_names = list(
+            checkpoint["classes"]
+        )
 
-        print("Loaded landmark model")
+        self.transformer_config = dict(
+            checkpoint["config"]
+        )
+
+        self.landmark_mean = np.asarray(
+            checkpoint["mean"],
+            dtype=np.float32,
+        ).reshape(1, -1)
+
+        self.landmark_std = np.asarray(
+            checkpoint["std"],
+            dtype=np.float32,
+        ).reshape(1, -1)
+
+        self.landmark_std[
+            self.landmark_std < 1e-6
+            ] = 1.0
+
+        self.landmark_model = LandmarkTransformer(
+            **self.transformer_config
+        ).to(self.device)
+
+        self.landmark_model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        self.landmark_model.eval()
+
+        print(
+            "Loaded landmark Transformer"
+        )
+
+        print(
+            "Classes:",
+            self.class_names
+        )
+
+        print(
+            "Transformer config:",
+            self.transformer_config
+        )
 
         # Không dùng group model nữa
         self.use_group_mns = False
@@ -166,6 +222,23 @@ class Application:
         self.bt5.place(x=802, y=745)
 
         self.video_loop()
+
+    def load_checkpoint(
+            self,
+            model_path
+    ):
+        try:
+            return torch.load(
+                model_path,
+                map_location=self.device,
+                weights_only=False,
+            )
+
+        except TypeError:
+            return torch.load(
+                model_path,
+                map_location=self.device,
+            )
 
     # =====================================================
     # SUGGESTIONS
@@ -316,37 +389,79 @@ class Application:
     # PREDICT LANDMARK
     # =====================================================
 
-    def predict_landmark(self, features):
-        probabilities = self.landmark_model.predict_proba(features)[0]
+    def predict_landmark(
+            self,
+            features
+    ):
+        normalized_features = (
+                                      features - self.landmark_mean
+                              ) / self.landmark_std
 
-        index = int(np.argmax(probabilities))
-        confidence = float(probabilities[index])
+        input_tensor = torch.from_numpy(
+            normalized_features.astype(
+                np.float32
+            )
+        ).to(self.device)
 
-        self.current_symbol = self.class_names[index]
+        with torch.no_grad():
+            logits = self.landmark_model(
+                input_tensor
+            )
+
+            probabilities = torch.softmax(
+                logits,
+                dim=1,
+            )[0]
+
+        index = int(
+            torch.argmax(
+                probabilities
+            ).item()
+        )
+
+        confidence = float(
+            probabilities[index].item()
+        )
+
+        self.current_symbol = (
+            self.class_names[index]
+        )
+
         self.current_confidence = confidence
 
-        if self.current_confidence < self.min_confidence:
+        if (
+                self.current_confidence
+                < self.min_confidence
+        ):
             self.current_symbol = "Uncertain"
+
             self.reset_stability()
+
             return
 
         symbol = self.current_symbol
 
         if symbol == self.last_symbol:
             self.stable_count += 1
+
         else:
             self.last_symbol = symbol
             self.stable_count = 1
 
         if self.add_cooldown > 0:
             self.add_cooldown -= 1
+
             return
 
-        if self.stable_count >= self.stable_required:
+        if (
+                self.stable_count
+                >= self.stable_required
+        ):
             self.word += symbol
-            self.add_cooldown = 20
-            self.stable_count = 0
 
+            self.add_cooldown = 20
+
+            self.stable_count = 0
     # =====================================================
     # VIDEO LOOP
     # =====================================================

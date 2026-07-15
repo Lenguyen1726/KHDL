@@ -1,15 +1,18 @@
 from pathlib import Path
 
 import cv2
-import joblib
 import mediapipe as mp
 import numpy as np
-
+import torch
+from landmark_transformer_model import LandmarkTransformer
 
 BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_PATH = BASE_DIR / "Models" / "asl_landmark_model.joblib"
-
+MODEL_PATH = (
+    BASE_DIR
+    / "Models"
+    / "asl_landmark_transformer.pth"
+)
 TEST_DIR = BASE_DIR / "kaggle_data" / "asl_alphabet_test" / "asl_alphabet_test"
 
 mp_hands = mp.solutions.hands
@@ -37,10 +40,32 @@ def normalize_landmarks(hand_landmarks):
 
 
 def main():
-    package = joblib.load(MODEL_PATH)
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
-    model = package["model"]
-    classes = package["classes"]
+    print(
+        "Thiết bị test:",
+        device
+    )
+
+    (
+        model,
+        classes,
+        mean,
+        std,
+    ) = load_transformer(device)
+
+    print(
+        "Loaded Transformer model"
+    )
+
+    print(
+        "Classes:",
+        classes
+    )
 
     if not TEST_DIR.exists():
         print("Không tìm thấy thư mục test:")
@@ -78,11 +103,14 @@ def main():
 
             features = normalize_landmarks(results.multi_hand_landmarks[0])
 
-            probs = model.predict_proba(features)[0]
-            idx = int(np.argmax(probs))
-
-            pred = classes[idx]
-            conf = float(probs[idx])
+            pred, conf = predict_transformer(
+                model=model,
+                features=features,
+                classes=classes,
+                mean=mean,
+                std=std,
+                device=device,
+            )
 
             total += 1
 
@@ -99,6 +127,115 @@ def main():
     if total > 0:
         print(f"Accuracy test Kaggle: {correct / total:.4f}")
 
+def load_checkpoint(
+    model_path,
+    device
+):
+    try:
+        return torch.load(
+            model_path,
+            map_location=device,
+            weights_only=False,
+        )
 
+    except TypeError:
+        return torch.load(
+            model_path,
+            map_location=device,
+        )
+def load_transformer(device):
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Không tìm thấy model: "
+            f"{MODEL_PATH}\n"
+            "Hãy chạy "
+            "train_landmark_transformer.py "
+            "trước."
+        )
+
+    checkpoint = load_checkpoint(
+        MODEL_PATH,
+        device
+    )
+
+    classes = list(
+        checkpoint["classes"]
+    )
+
+    config = dict(
+        checkpoint["config"]
+    )
+
+    mean = np.asarray(
+        checkpoint["mean"],
+        dtype=np.float32,
+    ).reshape(1, -1)
+
+    std = np.asarray(
+        checkpoint["std"],
+        dtype=np.float32,
+    ).reshape(1, -1)
+
+    std[
+        std < 1e-6
+    ] = 1.0
+
+    model = LandmarkTransformer(
+        **config
+    ).to(device)
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    model.eval()
+
+    return (
+        model,
+        classes,
+        mean,
+        std
+    )
+def predict_transformer(
+    model,
+    features,
+    classes,
+    mean,
+    std,
+    device,
+):
+    features = (
+        features - mean
+    ) / std
+
+    input_tensor = torch.from_numpy(
+        features.astype(
+            np.float32
+        )
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(
+            input_tensor
+        )
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1,
+        )[0]
+
+    index = int(
+        torch.argmax(
+            probabilities
+        ).item()
+    )
+
+    pred = classes[index]
+
+    confidence = float(
+        probabilities[index].item()
+    )
+
+    return pred, confidence
 if __name__ == "__main__":
     main()
